@@ -1,0 +1,54 @@
+.env
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+pip-wheel-metadata/
+
+# Test / coverage
+.pytest_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+
+# IDEs and editors
+.vscode/
+.idea/
+*.swp
+
+# Mac
+.DS_Store
+
+# Databases
+*.sqlite3
+*.db
+*.db-journal
+
+# Logs
+*.log
+
+# dotenv
+.env.local
+.env.*.local
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Packaging
+__pypackages__/
+
+# Instance folder used by Flask
+instance/
