@@ -36,6 +36,84 @@ def get_users():
     })
 
 
+@users_bp.route('/me', methods=['GET'])
+@jwt_required()
+def get_current_user():
+    """Get currently authenticated user.
+    
+    Returns:
+        JSON response with current user data
+    """
+    current_user_id = get_jwt_identity()
+    user = User.find_by_id(current_user_id)
+    
+    if not user:
+        return error_response('User not found', 404)
+    
+    return success_response({'user': user.to_dict()})
+
+
+@users_bp.route('/profile', methods=['GET'])
+@jwt_required()
+def get_profile():
+    """Get currently authenticated user's profile.
+    
+    Returns:
+        JSON response with user profile data
+    """
+    current_user_id = get_jwt_identity()
+    user = User.find_by_id(current_user_id)
+    
+    if not user:
+        return error_response('User not found', 404)
+    
+    return success_response({'user': user.to_dict()})
+
+
+@users_bp.route('/profile', methods=['PUT'])
+@jwt_required()
+def update_profile():
+    """Update currently authenticated user's profile.
+    
+    Expected JSON:
+        {
+            "username": "string" (optional, user's display name),
+            "phone_number": "string" (optional)
+        }
+    
+    Note: Email cannot be changed after account creation.
+    
+    Returns:
+        JSON response with updated user profile
+    """
+    data = request.get_json()
+    current_user_id = get_jwt_identity()
+    
+    user = User.find_by_id(current_user_id)
+    
+    if not user:
+        return error_response('User not found', 404)
+    
+    # Allow username (name) updates
+    if 'username' in data:
+        user.username = data['username']
+    
+    # Allow phone_number updates
+    if 'phone_number' in data:
+        user.phone_number = data['phone_number']
+    
+    # Reject any attempt to change email
+    if 'email' in data:
+        return error_response('Email cannot be changed', 400)
+    
+    try:
+        db.session.commit()
+        return success_response({'user': user.to_dict()}, 'User updated successfully')
+    except Exception as e:
+        db.session.rollback()
+        return error_response('Update failed', 500)
+
+
 @users_bp.route('/<int:user_id>', methods=['GET'])
 @jwt_required()
 def get_user(user_id):
@@ -48,23 +126,6 @@ def get_user(user_id):
         JSON response with user data
     """
     user = User.find_by_id(user_id)
-    
-    if not user:
-        return error_response('User not found', 404)
-    
-    return success_response({'user': user.to_dict()})
-
-
-@users_bp.route('/me', methods=['GET'])
-@jwt_required()
-def get_current_user():
-    """Get currently authenticated user.
-    
-    Returns:
-        JSON response with current user data
-    """
-    current_user_id = get_jwt_identity()
-    user = User.find_by_id(current_user_id)
     
     if not user:
         return error_response('User not found', 404)
@@ -144,68 +205,6 @@ def delete_user(user_id):
     
     if not user:
         return error_response('User not found', 404)
-    
-    try:
-        db.session.delete(user)
-        db.session.commit()
-        return success_response({}, 'User deleted successfully')
-    except Exception as e:
-        db.session.rollback()
-        return error_response('Delete failed', 500)
-
-
-@users_bp.route('/profile', methods=['GET'])
-@jwt_required()
-def get_profile():
-    """Get currently authenticated user's profile.
-    
-    Returns:
-        JSON response with user profile data
-    """
-    current_user_id = get_jwt_identity()
-    user = User.find_by_id(current_user_id)
-    
-    if not user:
-        return error_response('User not found', 404)
-    
-    return success_response({'user': user.to_dict()})
-
-
-@users_bp.route('/profile', methods=['PUT'])
-@jwt_required()
-def update_profile():
-    """Update currently authenticated user's profile.
-    
-    Expected JSON:
-        {
-            "username": "string" (optional, user's display name),
-            "phone_number": "string" (optional)
-        }
-    
-    Note: Email cannot be changed after account creation.
-    
-    Returns:
-        JSON response with updated user profile
-    """
-    data = request.get_json()
-    current_user_id = get_jwt_identity()
-    
-    user = User.find_by_id(current_user_id)
-    
-    if not user:
-        return error_response('User not found', 404)
-    
-    # Allow username (name) updates
-    if 'username' in data:
-        user.username = data['username']
-    
-    # Allow phone_number updates
-    if 'phone_number' in data:
-        user.phone_number = data['phone_number']
-    
-    # Reject any attempt to change email
-    if 'email' in data:
-        return error_response('Email cannot be changed', 400)
     
     try:
         db.session.commit()
