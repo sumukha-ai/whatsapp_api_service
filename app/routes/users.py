@@ -2,6 +2,7 @@
 from flask import Blueprint, request, jsonify
 from flask_jwt_extended import jwt_required, get_jwt_identity
 from app.models.user import User
+from app.models.whatsapp import WabaAccount
 from app.models import db
 from app.utils.utils import success_response, error_response
 
@@ -66,8 +67,14 @@ def get_profile():
     
     if not user:
         return error_response('User not found', 404)
-    
-    return success_response({'user': user.to_dict()})
+
+    user_data = user.to_dict()
+    has_whatsapp_account = WabaAccount.query.filter_by(user_id=current_user_id).first() is not None
+
+    if has_whatsapp_account:
+        user_data['whatsapp_status'] = 'connected'
+
+    return success_response({'user': user_data})
 
 
 @users_bp.route('/profile', methods=['PUT'])
