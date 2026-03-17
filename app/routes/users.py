@@ -121,6 +121,45 @@ def update_profile():
         return error_response('Update failed', 500)
 
 
+@users_bp.route('/change-password', methods=['PUT'])
+@jwt_required()
+def change_password():
+    """Change the authenticated user's password.
+
+    Expected JSON:
+        {
+            "oldPassword": "string",
+            "newPassword": "string"
+        }
+    """
+    data = request.get_json() or {}
+    old_password = data.get('oldPassword')
+    new_password = data.get('newPassword')
+
+    if not old_password or not new_password:
+        return error_response('oldPassword and newPassword are required', 400)
+
+    current_user_id = get_jwt_identity()
+    user = User.find_by_id(current_user_id)
+
+    if not user:
+        return error_response('User not found', 404)
+
+    if not user.check_password(old_password):
+        return error_response('Current password is incorrect', 401)
+
+    if old_password == new_password:
+        return error_response('New password must be different from current password', 400)
+
+    try:
+        user.set_password(new_password)
+        db.session.commit()
+        return success_response({}, 'Password updated successfully', 200)
+    except Exception:
+        db.session.rollback()
+        return error_response('Failed to update password', 500)
+
+
 @users_bp.route('/<int:user_id>', methods=['GET'])
 @jwt_required()
 def get_user(user_id):
