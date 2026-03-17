@@ -21,6 +21,10 @@ def create_app(config_name='development'):
     app = Flask(__name__)
     app.config.from_object(config_by_name[config_name])
     
+    # Configure logging to show INFO messages
+    logging.basicConfig(level=logging.INFO)
+    app.logger.setLevel(logging.INFO)
+    
     # Suppress verbose logging from SQLAlchemy and other libraries
     logging.getLogger('sqlalchemy.engine').setLevel(logging.WARNING)
     logging.getLogger('sqlalchemy.pool').setLevel(logging.WARNING)
@@ -29,19 +33,45 @@ def create_app(config_name='development'):
     # Initialize database, migrations, and JWT
     init_db(app)
     
-    # Enable CORS with allowed origins from config
-    allowed_origins = app.config.get('ALLOWED_ORIGINS', ['http://localhost:5173'])
-    CORS(app, origins=allowed_origins, supports_credentials=True)
+    # Enable CORS globally and ensure preflight requests are handled.
+    raw_origins = app.config.get('ALLOWED_ORIGINS', ['http://localhost:5173'])
+    if isinstance(raw_origins, str):
+        raw_origins = raw_origins.split(',')
+    allowed_origins = [origin.strip() for origin in raw_origins if origin and origin.strip()]
+    allow_any_origin = '*' in allowed_origins
+
+    # Build CORS config with proper credentials handling
+    cors_origins = '*' if allow_any_origin else allowed_origins
+    
+    # If using wildcard, don't require credentials; if using specific origins, allow them
+    cors_config = {
+        r"/*": {
+            'origins': cors_origins,
+            'methods': ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+            'allow_headers': ['Authorization', 'Content-Type', 'Accept'],
+            'expose_headers': ['Content-Type', 'Content-Length'],
+            'max_age': 86400,
+            'supports_credentials': True if not allow_any_origin else False,
+        }
+    }
+
+    CORS(app, resources=cors_config)
     
     # Register blueprints with URL prefixes
     from app.routes.auth import auth_bp
     from app.routes.users import users_bp
     from app.routes.embedded_signup import meta_bp
     from app.routes.webhook import webhook_bp
+    from app.routes.templates import templates_bp
+    from app.routes.chat import chat_bp
+    from app.routes.dashboard import dashboard_bp
     
     app.register_blueprint(auth_bp, url_prefix='/auth')
     app.register_blueprint(users_bp)
     app.register_blueprint(meta_bp)
     app.register_blueprint(webhook_bp)
+    app.register_blueprint(templates_bp, url_prefix='/templates')
+    app.register_blueprint(chat_bp)
+    app.register_blueprint(dashboard_bp)
     
     return app

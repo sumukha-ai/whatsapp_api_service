@@ -50,6 +50,7 @@ def register():
         }, 'User registered successfully', 201)
     
     except Exception as e:
+        print('e: ', e)
         db.session.rollback()
         return error_response('Registration failed', 500)
 

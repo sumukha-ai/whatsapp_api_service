@@ -1,7 +1,6 @@
 """Models for WhatsApp messaging domain entities."""
-from datetime import datetime
-
 from app.models import db
+from app.utils.datetime_utils import ist_now
 
 
 class Contact(db.Model):
@@ -13,7 +12,7 @@ class Contact(db.Model):
     name = db.Column(db.String(255), nullable=True)
     opt_in_status = db.Column(db.Boolean, nullable=False, default=False)
     opt_in_at = db.Column(db.DateTime, nullable=True)
-    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    created_at = db.Column(db.DateTime, nullable=False, default=ist_now)
 
 
 class Conversation(db.Model):
@@ -24,8 +23,8 @@ class Conversation(db.Model):
     contact_id = db.Column(db.Integer, db.ForeignKey('contacts.id'), nullable=False, index=True)
     status = db.Column(db.String(32), nullable=False, default='open', index=True)
     session_expires_at = db.Column(db.DateTime, nullable=True)
-    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
-    updated_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = db.Column(db.DateTime, nullable=False, default=ist_now)
+    updated_at = db.Column(db.DateTime, nullable=False, default=ist_now, onupdate=ist_now)
 
 
 class Template(db.Model):
@@ -84,7 +83,7 @@ class WebhookLog(db.Model):
     waba_account_id = db.Column(db.Integer, db.ForeignKey('waba_accounts.id'), nullable=True, index=True)
     payload = db.Column(db.JSON, nullable=False)
     processed = db.Column(db.Boolean, nullable=False, default=False, index=True)
-    received_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    received_at = db.Column(db.DateTime, nullable=False, default=ist_now)
     processed_at = db.Column(db.DateTime, nullable=True)
 
 
@@ -96,7 +95,7 @@ class Group(db.Model):
     name = db.Column(db.String(255), nullable=False, index=True)
     description = db.Column(db.Text, nullable=True)
     created_by = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False, index=True)
-    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    created_at = db.Column(db.DateTime, nullable=False, default=ist_now)
 
 
 class GroupContact(db.Model):
@@ -106,8 +105,42 @@ class GroupContact(db.Model):
     waba_account_id = db.Column(db.Integer, db.ForeignKey('waba_accounts.id'), nullable=True, index=True)
     group_id = db.Column(db.Integer, db.ForeignKey('groups.id'), nullable=False, index=True)
     contact_id = db.Column(db.Integer, db.ForeignKey('contacts.id'), nullable=False, index=True)
-    added_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    added_at = db.Column(db.DateTime, nullable=False, default=ist_now)
 
     __table_args__ = (
         db.UniqueConstraint('group_id', 'contact_id', name='uq_group_contacts_group_contact'),
     )
+
+
+class GroupMessage(db.Model):
+    __tablename__ = 'group_messages'
+
+    id = db.Column(db.Integer, primary_key=True)
+    waba_account_id = db.Column(db.Integer, db.ForeignKey('waba_accounts.id'), nullable=True, index=True)
+    group_id = db.Column(db.Integer, db.ForeignKey('groups.id'), nullable=False, index=True)
+    message_type = db.Column(db.String(32), nullable=False, index=True)
+    body = db.Column(db.Text, nullable=True)
+    template_payload = db.Column(db.JSON, nullable=True)
+    created_by = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False, index=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=ist_now, index=True)
+    updated_at = db.Column(db.DateTime, nullable=False, default=ist_now, onupdate=ist_now)
+
+
+class GroupMessageRecipient(db.Model):
+    __tablename__ = 'group_message_recipients'
+
+    id = db.Column(db.Integer, primary_key=True)
+    waba_account_id = db.Column(db.Integer, db.ForeignKey('waba_accounts.id'), nullable=True, index=True)
+    group_message_id = db.Column(db.Integer, db.ForeignKey('group_messages.id'), nullable=False, index=True)
+    contact_id = db.Column(db.Integer, db.ForeignKey('contacts.id'), nullable=False, index=True)
+    provider_message_id = db.Column(db.String(191), nullable=True, index=True)
+    status = db.Column(db.String(32), nullable=False, default='queued', index=True)
+    error_code = db.Column(db.String(64), nullable=True)
+    error_text = db.Column(db.Text, nullable=True)
+    queued_at = db.Column(db.DateTime, nullable=True)
+    sent_at = db.Column(db.DateTime, nullable=True)
+    delivered_at = db.Column(db.DateTime, nullable=True)
+    read_at = db.Column(db.DateTime, nullable=True)
+    failed_at = db.Column(db.DateTime, nullable=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=ist_now)
+    updated_at = db.Column(db.DateTime, nullable=False, default=ist_now, onupdate=ist_now)

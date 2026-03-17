@@ -1,7 +1,7 @@
 """User model for authentication and user management."""
-from datetime import datetime
 from werkzeug.security import generate_password_hash, check_password_hash
 from app.models import db
+from app.utils.datetime_utils import ist_now
 
 
 class User(db.Model):
@@ -24,8 +24,8 @@ class User(db.Model):
     email = db.Column(db.String(120), unique=True, nullable=False, index=True)
     phone_number = db.Column(db.String(20), nullable=True)
     password_hash = db.Column(db.String(255), nullable=False)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
-    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = db.Column(db.DateTime, default=ist_now, nullable=False)
+    updated_at = db.Column(db.DateTime, default=ist_now, onupdate=ist_now)
     
     def __repr__(self):
         """String representation of User."""
