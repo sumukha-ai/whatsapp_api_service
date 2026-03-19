@@ -10,6 +10,7 @@ from app.models.whatsapp import (
     Conversation,
     GroupMessageRecipient,
     Message,
+    Template,
     WabaAccount,
     WebhookLog,
 )
@@ -292,6 +293,47 @@ def _process_status_updates(value, waba_account_id):
                 recipient_record.error_text = first_error.get("details") or first_error.get("title")
 
 
+def _normalize_template_status(status):
+    return (status or '').strip().upper() or None
+
+
+def _process_template_status_update(value, entry_waba_id=None):
+    """Update local template status from template-status webhook payloads."""
+    if not isinstance(value, dict):
+        return False
+
+    template_status = _normalize_template_status(
+        value.get('message_template_status')
+        or value.get('status')
+        or value.get('event')
+    )
+    if not template_status:
+        return False
+
+    template_meta_id = value.get('message_template_id') or value.get('template_id')
+    template_name = value.get('message_template_name') or value.get('name')
+
+    query = Template.query
+    if entry_waba_id:
+        query = query.filter(Template.waba_id == entry_waba_id)
+
+    if template_meta_id:
+        query = query.filter(Template.meta_template_id == str(template_meta_id))
+    elif template_name:
+        query = query.filter(Template.template_name == str(template_name))
+    else:
+        return False
+
+    templates = query.all()
+    if not templates:
+        return False
+
+    for template in templates:
+        template.status = template_status
+
+    return True
+
+
 @webhook_bp.route("/webhook", methods=["POST"])
 def whatsapp_webhook_notifcation():
     data = request.get_json(silent=True) or {}
@@ -301,20 +343,28 @@ def whatsapp_webhook_notifcation():
 
     try:
         logger.info("Incoming webhook payload received")
+        has_template_status_updates = _process_template_status_update(data)
 
         for entry in data.get("entry", []):
             entry_waba_id = entry.get("id")
             for change in entry.get("changes", []):
+                value = change.get("value", {})
+                if _process_template_status_update(value, entry_waba_id):
+                    has_template_status_updates = True
+                    continue
+
                 if change.get("field") != "messages":
                     continue
 
-                value = change.get("value", {})
                 waba_account_id = _get_waba_account_id(value, entry_waba_id)
                 if webhook_log.waba_account_id is None:
                     webhook_log.waba_account_id = waba_account_id
 
                 _process_incoming_messages(value, waba_account_id)
                 _process_status_updates(value, waba_account_id)
+
+        if has_template_status_updates:
+            logger.info('Processed message template status updates from webhook payload')
 
         webhook_log.processed = True
         webhook_log.processed_at = ist_now()

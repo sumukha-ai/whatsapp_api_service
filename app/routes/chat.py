@@ -1,11 +1,13 @@
 """Chat and messaging routes for conversations, contacts, groups, and messages."""
 from collections import defaultdict
+import copy
 import csv
 from io import BytesIO, StringIO
 import json
 import logging
 import os
 from datetime import datetime, timedelta
+from urllib.parse import urlparse
 
 import requests
 from flask import Blueprint, request
@@ -26,12 +28,16 @@ from app.models.whatsapp import (
     WabaAccount,
 )
 from app.utils.datetime_utils import ist_now
+from app.utils.object_storage import upload_file
 from app.utils.utils import success_response, error_response
 
 chat_bp = Blueprint('chat', __name__)
 logger = logging.getLogger(__name__)
 
 CONVERSATION_WINDOW_HOURS = 24
+ALLOWED_IMAGE_MIME_TYPES = {'image/jpeg', 'image/png'}
+ALLOWED_IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png'}
+MAX_IMAGE_SIZE_BYTES = 5 * 1024 * 1024
 
 
 def send_wa_text_message(phone_number_id, access_token, payload, is_template=False):
@@ -68,6 +74,209 @@ def send_wa_text_message(phone_number_id, access_token, payload, is_template=Fal
     except Exception as e:
         raise ValueError(f"Failed to send whatsapp text message {e}")
 
+
+# ---------------------------------------------------------------------------
+# Request parsing
+# ---------------------------------------------------------------------------
+
+def _parse_send_message_request_payload():
+    """Parse JSON or multipart/form-data for the send-message endpoint.
+
+    Returns (data_dict, uploaded_file_or_None).
+    When the request is plain JSON there is no file upload; the caller must
+    check campaign_image_url in data_dict instead.
+    """
+    if request.is_json:
+        return request.get_json() or {}, None
+
+    form_data = request.form.to_dict(flat=True)
+    template_raw = form_data.get('template')
+    if template_raw is not None:
+        try:
+            form_data['template'] = json.loads(template_raw)
+        except (TypeError, ValueError):
+            raise ValueError('template must be valid JSON when using multipart/form-data')
+
+    uploaded_campaign_image = request.files.get('header_image') or request.files.get('file')
+    return form_data, uploaded_campaign_image
+
+
+def _coerce_int(value, field_name):
+    if value is None or value == '':
+        return None
+
+    if isinstance(value, int):
+        return value
+
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+
+    raise ValueError(f'{field_name} must be an integer')
+
+
+# ---------------------------------------------------------------------------
+# Graph API helpers
+# ---------------------------------------------------------------------------
+
+
+def _validate_campaign_image_file(uploaded_file):
+    if not uploaded_file:
+        raise ValueError('campaign_image is required for IMAGE header templates')
+
+    filename = (uploaded_file.filename or '').strip()
+    extension = os.path.splitext(filename)[1].lower()
+    if extension not in ALLOWED_IMAGE_EXTENSIONS:
+        raise ValueError('Allowed campaign image types are JPG and PNG only')
+
+    mime_type = (uploaded_file.mimetype or '').lower()
+    if mime_type not in ALLOWED_IMAGE_MIME_TYPES:
+        raise ValueError('Allowed campaign image MIME types are image/jpeg and image/png only')
+
+    uploaded_file.stream.seek(0, os.SEEK_END)
+    file_size = uploaded_file.stream.tell()
+    uploaded_file.stream.seek(0)
+    if file_size > MAX_IMAGE_SIZE_BYTES:
+        raise ValueError('Campaign image size must be 5 MB or smaller')
+
+    return filename, mime_type
+
+
+def _validate_campaign_image_url(image_url):
+    parsed = urlparse(image_url or '')
+    if parsed.scheme not in {'http', 'https'} or not parsed.netloc:
+        raise ValueError('campaign_image_url must be a valid http/https URL')
+
+    path = (parsed.path or '').lower()
+    if not any(path.endswith(ext) for ext in ALLOWED_IMAGE_EXTENSIONS):
+        raise ValueError('campaign_image_url must end with .jpg, .jpeg, or .png')
+
+
+def _template_payload_has_image_header(template_payload, template_record=None):
+    if template_record and (template_record.header_type or '').upper() == 'IMAGE':
+        return True
+
+    if not isinstance(template_payload, dict):
+        return False
+
+    for component in template_payload.get('components', []) or []:
+        if not isinstance(component, dict):
+            continue
+        component_type = (component.get('type') or '').upper()
+        component_format = (component.get('format') or '').upper()
+        if component_type == 'HEADER' and component_format == 'IMAGE':
+            return True
+
+    return False
+
+
+def _inject_image_header_parameter(template_payload, image_obj):
+    components = template_payload.setdefault('components', [])
+    if not isinstance(components, list):
+        raise ValueError('template.components must be an array')
+
+    header_component = None
+    for component in components:
+        if isinstance(component, dict) and (component.get('type') or '').upper() == 'HEADER':
+            header_component = component
+            break
+
+    parameter = {
+        'type': 'image',
+        'image': image_obj
+    }
+
+    if header_component is None:
+        components.append({
+            'type': 'header',
+            'parameters': [parameter],
+        })
+        return
+
+    header_component['parameters'] = [parameter]
+
+
+def _extract_image_link_from_template_payload(template_payload):
+    if not isinstance(template_payload, dict):
+        return None
+
+    components = template_payload.get('components', []) or []
+    for component in components:
+        if not isinstance(component, dict):
+            continue
+        if (component.get('type') or '').upper() != 'HEADER':
+            continue
+
+        for parameter in component.get('parameters', []) or []:
+            if not isinstance(parameter, dict):
+                continue
+            if (parameter.get('type') or '').lower() != 'image':
+                continue
+
+            image_payload = parameter.get('image')
+            if isinstance(image_payload, dict) and image_payload.get('link'):
+                return image_payload.get('link')
+
+    return None
+
+
+def _prepare_template_payload_for_send(
+    template_payload,
+    template_record,
+    waba_account,
+    campaign_image_file=None,
+    campaign_image_url=None,
+):
+    """Resolve the final template payload, handling IMAGE header assets.
+
+    If an image file is provided, upload it to object storage and inject the
+    returned public link into the template header parameters.
+    """
+    if not isinstance(template_payload, dict):
+        raise ValueError('template payload must be an object')
+
+    resolved_payload = copy.deepcopy(template_payload)
+
+    requires_image_header = _template_payload_has_image_header(
+        resolved_payload,
+        template_record=template_record,
+    )
+    if not requires_image_header:
+        return resolved_payload
+
+    if campaign_image_file and campaign_image_url:
+        raise ValueError('Provide either campaign_image file or campaign_image_url, not both')
+
+    if not campaign_image_file and not campaign_image_url:
+        raise ValueError('IMAGE header templates require campaign_image upload or campaign_image_url')
+
+    image_obj = None
+
+    if campaign_image_url:
+        _validate_campaign_image_url(campaign_image_url)
+        image_obj = {'link': campaign_image_url}
+    else:
+        _validate_campaign_image_file(campaign_image_file)
+        try:
+            campaign_image_link = upload_file(
+                campaign_image_file,
+                user_id=waba_account.user_id,
+                subfolder='campaign-images'
+            )
+            logger.info('campaign image uploaded to object storage: %s', campaign_image_link)
+            image_obj = {'link': campaign_image_link}
+        finally:
+            try:
+                campaign_image_file.close()
+            except Exception:
+                pass
+
+    _inject_image_header_parameter(resolved_payload, image_obj)
+    return resolved_payload
+
+
+# ---------------------------------------------------------------------------
+# Conversation window helpers
+# ---------------------------------------------------------------------------
 
 def _calculate_window_expires_at(start_time):
     return start_time + timedelta(hours=CONVERSATION_WINDOW_HOURS)
@@ -250,7 +459,6 @@ def _get_or_create_conversation_for_send(contact_id, waba_account_id, is_templat
     if active_conversation:
         return active_conversation, False, None
 
-    # No active conversation: only template messages can open a new 24-hour window.
     if not is_template:
         return None, True, {
             'error': 'CONVERSATION_WINDOW_EXPIRED',
@@ -302,7 +510,6 @@ def _resolve_header_index(headers, aliases):
 
 def _normalize_phone_number(raw_value, default_country_code='91'):
     normalized_raw = raw_value
-    # Excel numeric cells can arrive as floats (e.g. 9876543210.0).
     if isinstance(normalized_raw, float) and normalized_raw.is_integer():
         normalized_raw = int(normalized_raw)
 
@@ -407,7 +614,7 @@ def _contact_to_dict(contact, last_message=None):
         'name': contact.name,
         'created_at': contact.created_at.isoformat() if contact.created_at else None,
     }
-    
+
     if last_message:
         data['last_message'] = last_message.body or f"[{last_message.type}]"
         data['last_message_time'] = last_message.sent_at.isoformat() if last_message.sent_at else None
@@ -416,7 +623,7 @@ def _contact_to_dict(contact, last_message=None):
         data['last_message'] = None
         data['last_message_time'] = None
         data['last_message_type'] = None
-    
+
     return data
 
 
@@ -428,14 +635,14 @@ def _group_to_dict(group, last_message=None):
         'description': group.description,
         'created_at': group.created_at.isoformat() if group.created_at else None,
     }
-    
+
     if last_message:
         data['last_message'] = last_message.body or f"[{last_message.type}]"
         data['last_message_time'] = last_message.sent_at.isoformat() if last_message.sent_at else None
     else:
         data['last_message'] = None
         data['last_message_time'] = None
-    
+
     return data
 
 
@@ -446,6 +653,12 @@ def _message_to_dict(message):
         'id': message.id,
         'wamid': message.wamid,
         'body': message.body,
+        'media_url': message.media_url,
+        'template': (
+            {'header_image_url': message.media_url}
+            if message.type == 'template' and message.media_url
+            else None
+        ),
         'direction': message.direction,
         'type': message.type,
         'status': message.status,
@@ -526,47 +739,34 @@ def _group_message_to_dict(group_message, recipient_records, sender_name=None):
     }
 
 
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+
 @chat_bp.route('/contacts', methods=['GET'])
 @jwt_required()
 def get_contacts():
-    """Fetch the initial list of tabbed contacts.
-    
-    Returns:
-        Array of contact objects with last message preview:
-        [
-            {
-                'id': int,
-                'phone_number': str,
-                'name': str,
-                'last_message': str,
-                'last_message_time': str (ISO format),
-                'last_message_type': str,
-                'created_at': str (ISO format)
-            }
-        ]
-    """
+    """Fetch the initial list of tabbed contacts."""
     try:
         current_user_id = get_jwt_identity()
-        
-        # Get all WABA accounts for this user
+
         waba_accounts = _get_user_waba_accounts(current_user_id)
         waba_account_ids = [w.id for w in waba_accounts]
-        
+
         if not waba_account_ids:
             return success_response([], 'No contacts - configure WhatsApp account first')
-        
-        # Fetch contacts associated with these WABA accounts
+
         contacts = Contact.query.filter(
             Contact.waba_account_id.in_(waba_account_ids)
         ).order_by(desc(Contact.created_at)).all()
-        
+
         result = []
         for contact in contacts:
             last_message = _get_last_message_for_contact(contact.id)
             result.append(_contact_to_dict(contact, last_message))
-        
+
         return success_response(result, 'Contacts fetched successfully')
-    
+
     except Exception as e:
         logger.error(f"Error fetching contacts: {str(e)}", exc_info=True)
         return error_response('Failed to fetch contacts', 500)
@@ -685,8 +885,7 @@ def get_messages():
             per_page=limit,
             error_out=False
         )
-        
-        # Reverse the list so oldest is first when appending upward
+
         messages = [_message_to_dict(msg) for msg in reversed(pagination.items)]
 
         window_expires_at = _get_window_expires_at(conversation)
@@ -705,7 +904,7 @@ def get_messages():
             'total': pagination.total,
             'has_more': page < pagination.pages
         }, 'Messages fetched successfully')
-    
+
     except Exception as e:
         logger.error(f"Error fetching messages: {str(e)}", exc_info=True)
         return error_response('Failed to fetch messages', 500)
@@ -715,18 +914,28 @@ def get_messages():
 @chat_bp.route('/messages/send', methods=['POST'])
 @jwt_required()
 def send_message():
-    """Send a message to either a contact chat or a group chat context."""
+    """Send a message to either a contact chat or a group chat context.
+
+    Accepts both:
+      - application/json  (no image upload; use campaign_image_url for image templates)
+      - multipart/form-data  (supports header_image / file upload for image templates)
+    """
     try:
         logger.info("Received request to send message")
         current_user_id = get_jwt_identity()
-        data = request.get_json() or {}
+        data, uploaded_campaign_image = _parse_send_message_request_payload()
+
+        try:
+            contact_id = _coerce_int(data.get('contact_id'), 'contact_id')
+            group_id = _coerce_int(data.get('group_id'), 'group_id')
+        except ValueError as parse_error:
+            return error_response(str(parse_error), 422)
 
         chat_type = (data.get('chat_type') or ('group' if data.get('group_id') else 'contact')).lower()
-        contact_id = data.get('contact_id')
-        group_id = data.get('group_id')
         message_type = (data.get('type') or 'text').lower()
         body = data.get('body')
         template_payload = data.get('template')
+        campaign_image_url = (data.get('campaign_image_url') or '').strip() or None
         is_template = _is_template_message(message_type)
 
         if chat_type not in ('contact', 'group'):
@@ -789,8 +998,19 @@ def send_message():
                         .first()
                     )
 
-                formatted_template_body = _format_template_message_for_storage(
+                # Upload campaign image to object storage (if provided) and inject
+                # the resulting public link into template header parameters.
+                resolved_template_payload = _prepare_template_payload_for_send(
                     template_payload,
+                    template_record,
+                    waba_account,
+                    campaign_image_file=uploaded_campaign_image,
+                    campaign_image_url=campaign_image_url,
+                )
+                logger.info('resolved_template_payload: %s', resolved_template_payload)
+
+                formatted_template_body = _format_template_message_for_storage(
+                    resolved_template_payload,
                     template_record=template_record
                 )
 
@@ -798,7 +1018,7 @@ def send_message():
                     'messaging_product': 'whatsapp',
                     'to': contact.phone_number,
                     'type': 'template',
-                    'template': template_payload
+                    'template': resolved_template_payload
                 }
             else:
                 formatted_template_body = None
@@ -830,6 +1050,10 @@ def send_message():
                 direction='outbound',
                 type='template' if is_template else 'text',
                 body=body if not is_template else formatted_template_body,
+                media_url=(
+                    _extract_image_link_from_template_payload(resolved_template_payload)
+                    if is_template else None
+                ),
                 status='sent',
                 sent_at=ist_now(),
             )
@@ -849,6 +1073,7 @@ def send_message():
                 'message': _message_to_dict(message),
             }, 'Message sent successfully', 201)
 
+        # --- group path ---
         group = Group.query.filter_by(id=group_id).first()
         if not group:
             return error_response('Group not found', 404)
@@ -875,8 +1100,22 @@ def send_message():
                 .first()
             )
 
+        # For group sends with an image template: upload the image ONCE up front,
+        # then reuse the returned object-storage link for every recipient (avoids
+        # re-uploading the same file N times). We do this by resolving the template
+        # payload here before entering the per-recipient loop.
+        resolved_group_template_payload = None
+        if is_template:
+            resolved_group_template_payload = _prepare_template_payload_for_send(
+                template_payload,
+                template_record,
+                waba_account,
+                campaign_image_file=uploaded_campaign_image,
+                campaign_image_url=campaign_image_url,
+            )
+
         formatted_template_body = _format_template_message_for_storage(
-            template_payload,
+            resolved_group_template_payload,
             template_record=template_record
         ) if is_template else None
 
@@ -885,7 +1124,7 @@ def send_message():
             group_id=group.id,
             message_type='template' if is_template else 'text',
             body=formatted_template_body if is_template else body,
-            template_payload=template_payload if is_template else None,
+            template_payload=resolved_group_template_payload if is_template else None,
             created_by=current_user_id,
             created_at=ist_now(),
         )
@@ -921,7 +1160,7 @@ def send_message():
                     'messaging_product': 'whatsapp',
                     'to': recipient_contact.phone_number,
                     'type': 'template',
-                    'template': template_payload
+                    'template': resolved_group_template_payload
                 }
             else:
                 wa_payload = {
@@ -959,6 +1198,10 @@ def send_message():
                 direction='outbound',
                 type='template' if is_template else 'text',
                 body=formatted_template_body if is_template else body,
+                media_url=(
+                    _extract_image_link_from_template_payload(resolved_group_template_payload)
+                    if is_template else None
+                ),
                 status='sent',
                 sent_at=ist_now(),
             ))
@@ -989,64 +1232,48 @@ def send_message():
 @chat_bp.route('/contacts/add', methods=['POST'])
 @jwt_required()
 def add_contact():
-    """Save a newly created contact.
-    
-    Request Body:
-        {
-            'phone_number': str (required) - 10-digit number, '91' prefix auto-added,
-            'name': str (optional),
-            'waba_id': str (optional - if not provided, uses first user's WABA account)
-        }
-    
-    Returns:
-        Created contact object with generated ID
-    """
+    """Save a newly created contact."""
     try:
         current_user_id = get_jwt_identity()
         data = request.get_json()
-        
+
         phone_number = data.get('phone', '').strip()
         name = data.get('name', '').strip() or None
         waba_id = data.get('waba_id')
-        
+
         if not phone_number:
             return error_response('Missing phone_number', 400)
 
-        # ✅ Validate: must be exactly 10 digits
         if not phone_number.isdigit() or len(phone_number) != 10:
             return error_response('Phone number must be exactly 10 digits', 400)
 
-        # ✅ Prepend country code
         phone_number = '91' + phone_number
-        
-        # Check if contact already exists
+
         existing_contact = Contact.query.filter_by(phone_number=phone_number).first()
         if existing_contact:
             return error_response('Contact with this phone number already exists', 409)
-        
-        # Get WABA account for this user
+
         if waba_id:
             waba_account = WabaAccount.query.filter_by(waba_id=waba_id, user_id=current_user_id).first()
         else:
             waba_account = WabaAccount.query.filter_by(user_id=current_user_id).first()
-        
+
         if not waba_account:
             return error_response('No WhatsApp account configured', 400)
-        
-        # Create new contact
+
         contact = Contact(
             phone_number=phone_number,
             name=name,
             waba_account_id=waba_account.id,
         )
-        
+
         db.session.add(contact)
         db.session.commit()
-        
+
         logger.info(f"New contact added: {phone_number}")
-        
+
         return success_response(_contact_to_dict(contact), 'Contact added successfully', 201)
-    
+
     except Exception as e:
         db.session.rollback()
         logger.error(f"Error adding contact: {str(e)}", exc_info=True)
@@ -1120,7 +1347,6 @@ def bulk_add_contacts():
                     skipped_existing_other_account += 1
                     continue
 
-                # Update existing local contact only when a non-empty name is provided.
                 if has_name_column and parsed_name and existing_contact.name != parsed_name:
                     existing_contact.name = parsed_name
                     updated_count += 1
@@ -1429,7 +1655,6 @@ def update_group_crud(group_id):
             if validation_error:
                 return error_response(validation_error, 400)
 
-            # Keep group and membership under one WABA account.
             if resolved_waba_account_id and resolved_waba_account_id != group.waba_account_id:
                 return error_response('contact_ids belong to a different WABA account than this group', 400)
 

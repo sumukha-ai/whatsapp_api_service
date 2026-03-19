@@ -33,6 +33,7 @@ class Template(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     waba_account_id = db.Column(db.Integer, db.ForeignKey('waba_accounts.id'), nullable=True, index=True)
     waba_id = db.Column(db.String(128), nullable=False, index=True)
+    meta_template_id = db.Column(db.String(128), nullable=True, index=True)
     template_name = db.Column(db.String(255), nullable=False, index=True)
     category = db.Column(db.String(64), nullable=True)
     language = db.Column(db.String(32), nullable=False)
