@@ -34,6 +34,13 @@ def _parse_unix_timestamp(timestamp_value):
         return None
 
 
+def _json_for_log(payload):
+    try:
+        return json.dumps(payload, default=str)
+    except Exception:
+        return str(payload)
+
+
 def _extract_message_body(message):
     message_type = message.get("type", "text")
 
@@ -178,6 +185,13 @@ def _get_waba_account_id(value, entry_waba_id):
 
 
 def _process_incoming_messages(value, waba_account_id):
+    logger.info(
+        "Processing incoming messages: waba_account_id=%s contacts=%s messages=%s",
+        waba_account_id,
+        len(value.get("contacts", [])),
+        len(value.get("messages", [])),
+    )
+
     contacts_by_wa_id = {
         c.get("wa_id"): c.get("profile", {}).get("name")
         for c in value.get("contacts", [])
@@ -185,8 +199,11 @@ def _process_incoming_messages(value, waba_account_id):
     }
 
     for incoming_message in value.get("messages", []):
+        logger.info("Incoming message event: %s", _json_for_log(incoming_message))
+
         from_phone = incoming_message.get("from")
         if not from_phone:
+            logger.warning("Incoming message skipped because sender is missing: %s", _json_for_log(incoming_message))
             continue
 
         contact_name = contacts_by_wa_id.get(from_phone)
@@ -215,9 +232,26 @@ def _process_incoming_messages(value, waba_account_id):
         message_record.status = "received"
         message_record.sent_at = received_at
 
+        logger.info(
+            "Inbound message processed: wamid=%s contact_id=%s conversation_id=%s status=%s type=%s",
+            message_record.wamid,
+            message_record.contact_id,
+            message_record.conversation_id,
+            message_record.status,
+            message_record.type,
+        )
+
 
 def _process_status_updates(value, waba_account_id):
+    logger.info(
+        "Processing status updates: waba_account_id=%s statuses=%s",
+        waba_account_id,
+        len(value.get("statuses", [])),
+    )
+
     for status_item in value.get("statuses", []):
+        logger.info("Status event: %s", _json_for_log(status_item))
+
         wamid = status_item.get("id")
         status_value = status_item.get("status")
         status_timestamp = _parse_unix_timestamp(status_item.get("timestamp"))
@@ -250,6 +284,12 @@ def _process_status_updates(value, waba_account_id):
             db.session.add(message_record)
 
         if message_record is None:
+            logger.warning(
+                "Status event skipped because no message record could be resolved: wamid=%s recipient_id=%s status=%s",
+                wamid,
+                recipient_id,
+                status_value,
+            )
             continue
 
         if conversation is None:
@@ -270,6 +310,15 @@ def _process_status_updates(value, waba_account_id):
             message_record.delivered_at = status_timestamp or message_record.delivered_at
         elif status_value == "read":
             message_record.read_at = status_timestamp or message_record.read_at
+
+        logger.info(
+            "Message status updated: wamid=%s status=%s sent_at=%s delivered_at=%s read_at=%s",
+            message_record.wamid,
+            message_record.status,
+            message_record.sent_at,
+            message_record.delivered_at,
+            message_record.read_at,
+        )
 
         recipient_record = GroupMessageRecipient.query.filter_by(provider_message_id=wamid).one_or_none() if wamid else None
         if recipient_record is None:
@@ -292,6 +341,16 @@ def _process_status_updates(value, waba_account_id):
                 recipient_record.error_code = str(first_error.get("code") or first_error.get("title") or "WA_SEND_FAILED")
                 recipient_record.error_text = first_error.get("details") or first_error.get("title")
 
+        logger.info(
+            "Group recipient status updated: provider_message_id=%s status=%s sent_at=%s delivered_at=%s read_at=%s failed_at=%s",
+            recipient_record.provider_message_id,
+            recipient_record.status,
+            recipient_record.sent_at,
+            recipient_record.delivered_at,
+            recipient_record.read_at,
+            recipient_record.failed_at,
+        )
+
 
 def _normalize_template_status(status):
     return (status or '').strip().upper() or None
@@ -301,6 +360,12 @@ def _process_template_status_update(value, entry_waba_id=None):
     """Update local template status from template-status webhook payloads."""
     if not isinstance(value, dict):
         return False
+
+    logger.info(
+        "Checking template status event: entry_waba_id=%s payload=%s",
+        entry_waba_id,
+        _json_for_log(value),
+    )
 
     template_status = _normalize_template_status(
         value.get('message_template_status')
@@ -326,10 +391,26 @@ def _process_template_status_update(value, entry_waba_id=None):
 
     templates = query.all()
     if not templates:
+        logger.info(
+            "Template status update received but no template matched: entry_waba_id=%s template_meta_id=%s template_name=%s status=%s",
+            entry_waba_id,
+            template_meta_id,
+            template_name,
+            template_status,
+        )
         return False
 
     for template in templates:
         template.status = template_status
+
+    logger.info(
+        "Template status updated: entry_waba_id=%s matched_templates=%s template_meta_id=%s template_name=%s status=%s",
+        entry_waba_id,
+        len(templates),
+        template_meta_id,
+        template_name,
+        template_status,
+    )
 
     return True
 
@@ -337,26 +418,42 @@ def _process_template_status_update(value, entry_waba_id=None):
 @webhook_bp.route("/webhook", methods=["POST"])
 def whatsapp_webhook_notifcation():
     data = request.get_json(silent=True) or {}
+    logger.info("Webhook POST received: %s", _json_for_log(data))
+
     webhook_log = WebhookLog(payload=data, processed=False)
     db.session.add(webhook_log)
     db.session.commit()
 
     try:
-        logger.info("Incoming webhook payload received")
+        logger.info("Incoming webhook payload persisted in webhook_log id=%s", webhook_log.id)
         has_template_status_updates = _process_template_status_update(data)
 
         for entry in data.get("entry", []):
             entry_waba_id = entry.get("id")
+            logger.info("Processing entry: waba_id=%s entry=%s", entry_waba_id, _json_for_log(entry))
+
             for change in entry.get("changes", []):
+                logger.info("Processing change: field=%s change=%s", change.get("field"), _json_for_log(change))
+
                 value = change.get("value", {})
                 if _process_template_status_update(value, entry_waba_id):
                     has_template_status_updates = True
                     continue
 
                 if change.get("field") != "messages":
+                    logger.info(
+                        "Skipping unsupported change field: field=%s value=%s",
+                        change.get("field"),
+                        _json_for_log(value),
+                    )
                     continue
 
                 waba_account_id = _get_waba_account_id(value, entry_waba_id)
+                logger.info(
+                    "Resolved WABA account for message change: entry_waba_id=%s waba_account_id=%s",
+                    entry_waba_id,
+                    waba_account_id,
+                )
                 if webhook_log.waba_account_id is None:
                     webhook_log.waba_account_id = waba_account_id
 
@@ -369,6 +466,7 @@ def whatsapp_webhook_notifcation():
         webhook_log.processed = True
         webhook_log.processed_at = ist_now()
         db.session.commit()
+        logger.info("Webhook processing completed successfully for webhook_log id=%s", webhook_log.id)
     except Exception as e:
         db.session.rollback()
         logger.error(f"Error processing webhook: {str(e)}", exc_info=True)
@@ -383,15 +481,24 @@ def whatsapp_webhook_notifcation():
 
 @webhook_bp.route("/webhook", methods=["GET"])
 def whatsapp_webhook():
-    logger.info("\n\n *************Calling the webhook verify*******************\n\n")
+    logger.info("Calling webhook verification endpoint")
     hub_mode = request.args.get('hub.mode')
     hub_verify_token = request.args.get('hub.verify_token')
     hub_challenge = request.args.get('hub.challenge')
     expected_verify_token = current_app.config.get('WHATSAPP_WEBHOOK_VERIFY_TOKEN')
 
+    logger.info(
+        "Webhook verify request params: hub.mode=%s hub.verify_token_present=%s hub.challenge_present=%s",
+        hub_mode,
+        bool(hub_verify_token),
+        bool(hub_challenge),
+    )
+
     if hub_mode == "subscribe" and hub_verify_token == expected_verify_token:
+        logger.info("Webhook verification successful")
         return str(hub_challenge)
     else:
+        logger.warning("Webhook verification failed")
         abort(401)
 
 
