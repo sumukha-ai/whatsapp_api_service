@@ -1,16 +1,49 @@
 """Application factory for Flask application."""
+import os
 import logging
 from flask import Flask
 from flask_cors import CORS
 from celery import Celery
 from app.config import config_by_name
 from app.database import init_db
-from app.celery_worker import make_celery
 
 
 # Module-level celery instance
-celery = None
+celery = Celery(__name__, broker='redis://localhost:6379/1')
 
+
+celery.conf.update(
+    broker_url='redis://localhost:6379/1',
+    result_backend='redis://localhost:6379/1',
+    include=['app.tasks.whatsapp_tasks'],
+    task_default_queue='whatsapp',
+    worker_pool='threads',
+    broker_connection_retry_on_startup=True,
+    task_acks_late=True,
+    worker_prefetch_multiplier=1,
+)
+
+_worker_app = None
+
+
+def _get_worker_app():
+    """Lazily create Flask app used by Celery worker tasks."""
+    global _worker_app
+    if _worker_app is None:
+        config_name = os.environ.get('FLASK_ENV', 'development')
+        _worker_app = create_app(config_name)
+    return _worker_app
+
+
+class ContextTask(celery.Task):
+    """Celery task that runs with Flask app context."""
+    def __call__(self, *args, **kwargs):
+        app = _get_worker_app()
+        with app.app_context():
+            return self.run(*args, **kwargs)
+
+
+celery.Task = ContextTask
 
 def create_app(config_name='development'):
     """Create and configure the Flask application.
@@ -23,9 +56,7 @@ def create_app(config_name='development'):
     
     Returns:
         Flask application instance with all extensions initialized
-    """
-    global celery
-    
+    """    
     app = Flask(__name__)
     app.config.from_object(config_by_name[config_name])
     
@@ -40,19 +71,6 @@ def create_app(config_name='development'):
     
     # Initialize database, migrations, and JWT
     init_db(app)
-    
-    # Initialize Celery with Flask app context
-    celery = make_celery()
-    celery.conf.update(app.config)
-    
-    # Wrap Celery tasks with Flask app context
-    class ContextTask(celery.Task):
-        """Celery task that runs with Flask app context."""
-        def __call__(self, *args, **kwargs):
-            with app.app_context():
-                return self.run(*args, **kwargs)
-    
-    celery.Task = ContextTask
     
     # Enable CORS globally and ensure preflight requests are handled.
     raw_origins = app.config.get('ALLOWED_ORIGINS', ['http://localhost:5173'])
