@@ -169,8 +169,8 @@ async def send_one_async(client, record, waba_account, is_template):
         # Prepare request
         base_url = os.getenv('GRAPH_URL_BASE', 'https://graph.facebook.com')
         url_version = os.getenv('GRAPH_URL_VERSION', 'v22.0')
-        # url = f"{base_url}/{url_version}/{waba_account.phone_number_id}/messages"
-        url = f"http://localhost:5000/dummy"  # For testing with mock API
+        url = f"{base_url}/{url_version}/{waba_account.phone_number_id}/messages"
+        # url = f"http://localhost:5000/dummy"  # For testing with mock API
         
         headers = {
             'Authorization': f'Bearer {waba_account.access_token}',

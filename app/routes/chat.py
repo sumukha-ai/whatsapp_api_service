@@ -1215,11 +1215,6 @@ def get_group_message_status(group_message_id):
         logger.error(f"Error fetching message status: {str(e)}", exc_info=True)
         return error_response('Failed to fetch message status', 500)
 
-@chat_bp.route('/dummy', methods=['GET'])
-def dummy():
-    logger.info("Dummy endpoint called")
-    return success_response({'message': 'Dummy endpoint'}, 'Dummy endpoint called', 200)
-
 
 @chat_bp.route('/contacts/add', methods=['POST'])
 @jwt_required()
