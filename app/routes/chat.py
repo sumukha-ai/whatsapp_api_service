@@ -1131,7 +1131,7 @@ def send_message():
         db.session.add(group_message)
         db.session.flush()
 
-        recipient_records = []
+        # Create GroupMessageRecipient records with status=queued
         for recipient_contact in recipients:
             recipient_record = GroupMessageRecipient(
                 waba_account_id=group.waba_account_id,
@@ -1141,92 +1141,79 @@ def send_message():
                 queued_at=ist_now(),
             )
             db.session.add(recipient_record)
-            recipient_records.append(recipient_record)
-
-            conversation, _, policy_error = _get_or_create_conversation_for_send(
-                recipient_contact.id,
-                group.waba_account_id,
-                is_template=is_template
-            )
-            if policy_error:
-                recipient_record.status = 'failed'
-                recipient_record.error_code = policy_error.get('error')
-                recipient_record.error_text = policy_error.get('message')
-                recipient_record.failed_at = ist_now()
-                continue
-
-            if is_template:
-                wa_payload = {
-                    'messaging_product': 'whatsapp',
-                    'to': recipient_contact.phone_number,
-                    'type': 'template',
-                    'template': resolved_group_template_payload
-                }
-            else:
-                wa_payload = {
-                    'messaging_product': 'whatsapp',
-                    'to': recipient_contact.phone_number,
-                    'type': 'text',
-                    'text': {
-                        'body': body
-                    }
-                }
-
-            wa_message_id, wa_status_code, wa_error = send_wa_text_message(
-                waba_account.phone_number_id,
-                waba_account.access_token,
-                wa_payload,
-                is_template=is_template
-            )
-
-            if wa_error:
-                recipient_record.status = 'failed'
-                recipient_record.error_code = str(wa_status_code or 'WA_SEND_FAILED')
-                recipient_record.error_text = wa_error
-                recipient_record.failed_at = ist_now()
-                continue
-
-            recipient_record.provider_message_id = wa_message_id
-            recipient_record.status = 'sent'
-            recipient_record.sent_at = ist_now()
-
-            db.session.add(Message(
-                waba_account_id=group.waba_account_id,
-                conversation_id=conversation.id,
-                contact_id=recipient_contact.id,
-                wamid=wa_message_id,
-                direction='outbound',
-                type='template' if is_template else 'text',
-                body=formatted_template_body if is_template else body,
-                media_url=(
-                    _extract_image_link_from_template_payload(resolved_group_template_payload)
-                    if is_template else None
-                ),
-                status='sent',
-                sent_at=ist_now(),
-            ))
 
         db.session.commit()
 
-        status_summary = _summarize_group_recipient_statuses(recipient_records)
-        failed_count = status_summary.get('failed', 0)
-        recipient_count = len(recipient_records)
-        accepted_count = recipient_count - failed_count
+        # Dispatch async task to send messages
+        from app.tasks.whatsapp_tasks import dispatch_group_message
+        dispatch_group_message.delay(
+            group_message_id=group_message.id,
+            waba_account_id=group.waba_account_id,
+            is_template=is_template
+        )
 
+        recipient_count = len(recipients)
         return success_response({
             'message_id': group_message.id,
             'chat_type': 'group',
             'group_id': group.id,
             'recipient_count': recipient_count,
-            'accepted_count': accepted_count,
-            'failed_count': failed_count,
-            'status_summary': status_summary,
-        }, 'Group message send processed', 201)
+            'status': 'queued',
+        }, 'Group message queued for delivery', 202)
 
     except Exception as e:
         db.session.rollback()
         logger.error(f"Error sending message: {str(e)}", exc_info=True)
         return error_response('Failed to send message', 500)
+
+
+@chat_bp.route('/messages/<int:group_message_id>/status', methods=['GET'])
+@jwt_required()
+def get_group_message_status(group_message_id):
+    """Get the status of a group message.
+    
+    Returns counts of sent, failed, queued messages and a done boolean.
+    """
+    try:
+        current_user_id = get_jwt_identity()
+        
+        # Fetch group message to verify it exists
+        group_message = GroupMessage.query.filter_by(id=group_message_id).first()
+        if not group_message:
+            return error_response('Group message not found', 404)
+        
+        # Verify user has access to this group
+        waba_accounts = _get_user_waba_accounts(current_user_id)
+        waba_account_ids = [w.id for w in waba_accounts]
+        if group_message.waba_account_id not in waba_account_ids:
+            return error_response('Unauthorized access to group message', 403)
+        
+        # Get all recipient records for this group message
+        recipients = GroupMessageRecipient.query.filter_by(
+            group_message_id=group_message_id
+        ).all()
+        
+        # Count by status
+        total = len(recipients)
+        sent_count = sum(1 for r in recipients if r.status == 'sent')
+        failed_count = sum(1 for r in recipients if r.status == 'failed')
+        queued_count = sum(1 for r in recipients if r.status == 'queued')
+        
+        # done is true when all messages have been processed (no queued messages)
+        done = queued_count == 0
+        
+        return success_response({
+            'group_message_id': group_message_id,
+            'total': total,
+            'sent': sent_count,
+            'failed': failed_count,
+            'queued': queued_count,
+            'done': done,
+        }, 'Group message status retrieved successfully', 200)
+    
+    except Exception as e:
+        logger.error(f"Error fetching message status: {str(e)}", exc_info=True)
+        return error_response('Failed to fetch message status', 500)
 
 
 @chat_bp.route('/contacts/add', methods=['POST'])

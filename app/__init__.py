@@ -2,8 +2,14 @@
 import logging
 from flask import Flask
 from flask_cors import CORS
+from celery import Celery
 from app.config import config_by_name
 from app.database import init_db
+from app.celery_worker import make_celery
+
+
+# Module-level celery instance
+celery = None
 
 
 def create_app(config_name='development'):
@@ -18,6 +24,8 @@ def create_app(config_name='development'):
     Returns:
         Flask application instance with all extensions initialized
     """
+    global celery
+    
     app = Flask(__name__)
     app.config.from_object(config_by_name[config_name])
     
@@ -32,6 +40,19 @@ def create_app(config_name='development'):
     
     # Initialize database, migrations, and JWT
     init_db(app)
+    
+    # Initialize Celery with Flask app context
+    celery = make_celery()
+    celery.conf.update(app.config)
+    
+    # Wrap Celery tasks with Flask app context
+    class ContextTask(celery.Task):
+        """Celery task that runs with Flask app context."""
+        def __call__(self, *args, **kwargs):
+            with app.app_context():
+                return self.run(*args, **kwargs)
+    
+    celery.Task = ContextTask
     
     # Enable CORS globally and ensure preflight requests are handled.
     raw_origins = app.config.get('ALLOWED_ORIGINS', ['http://localhost:5173'])
