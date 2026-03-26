@@ -1,7 +1,7 @@
 """Application factory for Flask application."""
 import os
 import logging
-from flask import Flask
+from flask import Flask, request
 from flask_cors import CORS
 from celery import Celery
 from app.config import config_by_name
@@ -114,5 +114,12 @@ def create_app(config_name='development'):
     app.register_blueprint(templates_bp, url_prefix='/templates')
     app.register_blueprint(chat_bp)
     app.register_blueprint(dashboard_bp)
+    
+    @app.after_request
+    def log_request(response):
+        logging.getLogger(__name__).info(
+            '%s %s %s', request.method, request.path, response.status_code
+        )
+        return response
     
     return app
