@@ -6,6 +6,7 @@ from flask_cors import CORS
 from celery import Celery
 from app.config import config_by_name
 from app.database import init_db
+from app.logging_config import setup_flask_logging, setup_celery_logging
 
 
 # Module-level celery instance
@@ -22,6 +23,8 @@ celery.conf.update(
     task_acks_late=True,
     worker_prefetch_multiplier=1,
 )
+
+setup_celery_logging()
 
 _worker_app = None
 
@@ -58,11 +61,10 @@ def create_app(config_name='development'):
         Flask application instance with all extensions initialized
     """    
     app = Flask(__name__)
+    setup_flask_logging(app)
     app.config.from_object(config_by_name[config_name])
-    
-    # Configure logging to show INFO messages
-    logging.basicConfig(level=logging.INFO)
-    app.logger.setLevel(logging.INFO)
+
+    logging.getLogger(__name__).setLevel(logging.INFO)
     
     # Suppress verbose logging from SQLAlchemy and other libraries
     logging.getLogger('sqlalchemy.engine').setLevel(logging.WARNING)

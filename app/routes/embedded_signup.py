@@ -14,8 +14,7 @@ from app.config import Config
 
 meta_bp = Blueprint("meta_bp", __name__)
 
-logger = logging.getLogger("__name__")
-
+logger = logging.getLogger(__name__)
 
 @meta_bp.route("/embedded_signup", methods=["POST", "OPTIONS"])
 @jwt_required()

@@ -14,7 +14,7 @@ def catch_internal_error(f: Callable) -> Callable:
         except Exception as e:
             # Handle exception by logging and returning a custom error message
             method_name = f.__name__
-            logging.getLogger("__name__").error(f"Internal error in {method_name}: {e}")
+            logging.getLogger(__name__).error(f"Internal error in {method_name}: {e}")
             return jsonify({
                 "error": f"Internal error occurred in method '{method_name}'"
             }), 500
